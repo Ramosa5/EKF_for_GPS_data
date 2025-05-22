@@ -1,0 +1,16 @@
+01. latitude of WGS84 Lat-Long-Height coordinates (LLH) (deg).
+02. longitude of WGS84 Lat-Long-Height coordinates (LLH) (deg).
+03. altitude of WGS84 Lat-Long-Height coordinates (LLH) (m).
+04. quaternion x
+05. quaternion y
+06. quaternion z
+07. quaternion w
+08. linear velocity x in NED system (i.e., towards North (m/s))
+09. linear velocity y in NED system (i.e., towards East (m/s))
+10. linear velocity z in NED system (i.e., towards Down (m/s))
+11. angular rate around x (rad/s)
+12. angular rate around y (rad/s)
+13. angular rate around z (rad/s)
+14. nav status: Filter state (0: Start Up, 1: Initializatin, 2: Valid, 3: Error)
+15. nav status: Filter dynamics mode (1:Portable, 2: Automotive, 3:Airborne)
+16. nav status: Filter status flags (If flags is not 0, there are some warnings. See https://www.microstrain.com/sites/default/files/3dm-gx5-45_dcp_manual_8500-0064_0.pdf, page 155)

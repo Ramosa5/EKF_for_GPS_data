@@ -1,119 +1,249 @@
-import pandas as pd
 import numpy as np
-from pyproj import Transformer
+from glob import glob
+import os
 import matplotlib.pyplot as plt
+# WGS84 constants for conversion
+a = 6378137.0  # semi-major axis
+f = 1 / 298.257223563  # flattening
+b = a * (1 - f)  # semi-minor axis
+e_sq = f * (2 - f)  # eccentricity squared
 
-# Load CSV
-df = pd.read_csv("LeesburgToIndy.csv", delimiter=';', skiprows=1)
 
-# Extract and rename relevant columns
-df = df[[
-    'Time since start in ms ',
-    'LINEAR ACCELERATION X (m/s²)',
-    'LINEAR ACCELERATION Y (m/s²)',
-    'LOCATION Latitude : ',
-    'LOCATION Longitude : ',
-    'LOCATION Speed ( Kmh)'
-]].copy()
-df.columns = ['time_ms', 'acc_x', 'acc_y', 'lat', 'lon', 'speed_kmh']
+def llh_to_ecef(lat, lon, alt):
+    """Convert lat, lon (deg), alt (m) to ECEF coordinates (meters)."""
+    lat_rad = np.radians(lat)
+    lon_rad = np.radians(lon)
+    N = a / np.sqrt(1 - e_sq * np.sin(lat_rad) ** 2)
+    x = (N + alt) * np.cos(lat_rad) * np.cos(lon_rad)
+    y = (N + alt) * np.cos(lat_rad) * np.sin(lon_rad)
+    z = (N * (1 - e_sq) + alt) * np.sin(lat_rad)
+    return np.array([x, y, z])
 
-# Clean data
-df.dropna(subset=['lat', 'lon'], inplace=True)
-df['time_s'] = df['time_ms'] / 1000.0
-df['speed_mps'] = df['speed_kmh'] * (1000 / 3600)
 
-# Convert lat/lon to UTM coordinates (meters)
-transformer = Transformer.from_crs("epsg:4326", "epsg:32618", always_xy=True)
-df['x'], df['y'] = transformer.transform(df['lon'].values, df['lat'].values)
+def ecef_to_enu(x, y, z, lat_ref, lon_ref, alt_ref):
+    """Convert ECEF xyz to local ENU coordinates relative to reference."""
+    # Reference ECEF
+    ref_xyz = llh_to_ecef(lat_ref, lon_ref, alt_ref)
 
-# Prepare data
-dt_list = df['time_s'].diff().fillna(0).values
-acc_x = df['acc_x'].values
-acc_y = df['acc_y'].values
-gps_x = df['x'].values
-gps_y = df['y'].values
+    # Rotation matrix
+    lat_rad = np.radians(lat_ref)
+    lon_rad = np.radians(lon_ref)
 
-# Initial state
-x = np.array([gps_x[0], gps_y[0], 0, 0])
-P = np.eye(4)
-Q = np.eye(4) * 0.1
-R = np.eye(2) * 5
-I = np.eye(4)
-
-# EKF functions
-def f(x, u, dt):
-    px, py, vx, vy = x
-    ax, ay = u
-    return np.array([
-        px + vx * dt + 0.5 * ax * dt**2,
-        py + vy * dt + 0.5 * ay * dt**2,
-        vx + ax * dt,
-        vy + ay * dt
+    R = np.array([
+        [-np.sin(lon_rad), np.cos(lon_rad), 0],
+        [-np.sin(lat_rad) * np.cos(lon_rad), -np.sin(lat_rad) * np.sin(lon_rad), np.cos(lat_rad)],
+        [np.cos(lat_rad) * np.cos(lon_rad), np.cos(lat_rad) * np.sin(lon_rad), np.sin(lat_rad)]
     ])
 
-def F_jacobian(dt):
-    return np.array([
-        [1, 0, dt, 0],
-        [0, 1, 0, dt],
-        [0, 0, 1,  0],
-        [0, 0, 0,  1]
-    ])
+    diff = np.array([x, y, z]) - ref_xyz
+    enu = R @ diff
+    return enu  # East, North, Up
 
-H = np.array([
-    [1, 0, 0, 0],
-    [0, 1, 0, 0]
-])
 
-# Run EKF
-estimates = []
-for i in range(len(df)):
-    dt = dt_list[i]
-    u = np.array([acc_x[i], acc_y[i]])
+def llh_to_enu(lat, lon, alt, lat_ref, lon_ref, alt_ref):
+    """Convert lat, lon, alt to ENU coordinates."""
+    x, y, z = llh_to_ecef(lat, lon, alt)
+    enu = ecef_to_enu(x, y, z, lat_ref, lon_ref, alt_ref)
+    return enu
 
-    # Predict
-    x_pred = f(x, u, dt)
-    F = F_jacobian(dt)
-    P_pred = F @ P @ F.T + Q
 
-    # Update
-    z = np.array([gps_x[i], gps_y[i]])
-    y_k = z - H @ x_pred
-    S = H @ P_pred @ H.T + R
-    K = P_pred @ H.T @ np.linalg.inv(S)
-    x = x_pred + K @ y_k
-    P = (I - K @ H) @ P_pred
+# Kalman Filter Class
+class KalmanFilter:
+    def __init__(self, dt):
+        # State vector: [x, y, z, vx, vy, vz]
+        self.dt = dt
+        self.x = np.zeros((6, 1))
+        self.P = np.eye(6) * 1.0  # Initial covariance
 
-    estimates.append(x.copy())
+        # State transition matrix
+        self.F = np.eye(6)
+        self.F[0, 3] = dt
+        self.F[1, 4] = dt
+        self.F[2, 5] = dt
 
-# Result DataFrame
-ekf_result = pd.DataFrame(estimates, columns=['ekf_x', 'ekf_y', 'ekf_vx', 'ekf_vy'])
-ekf_result['gps_x'] = gps_x
-ekf_result['gps_y'] = gps_y
-ekf_result['time_s'] = df['time_s'].values
+        # Control matrix (acceleration input)
+        self.B = np.zeros((6, 3))
+        self.B[0, 0] = 0.5 * dt ** 2
+        self.B[1, 1] = 0.5 * dt ** 2
+        self.B[2, 2] = 0.5 * dt ** 2
+        self.B[3, 0] = dt
+        self.B[4, 1] = dt
+        self.B[5, 2] = dt
 
-# --- Visualization ---
+        # Measurement matrix: we measure positions only (GPS)
+        self.H = np.zeros((3, 6))
+        self.H[0, 0] = 1
+        self.H[1, 1] = 1
+        self.H[2, 2] = 1
 
-# Plot 1: Trajectory
-plt.figure(figsize=(10, 6))
-plt.plot(df['x'], df['y'], label='GPS Raw', linestyle='--', alpha=0.6)
-plt.plot(ekf_result['ekf_x'], ekf_result['ekf_y'], label='EKF Estimated', linewidth=2)
-plt.xlabel('X Position (m)')
-plt.ylabel('Y Position (m)')
-plt.title('GPS vs EKF Position')
+        # Process noise covariance
+        q = 1e-3
+        self.Q = np.eye(6) * q
+
+        # Measurement noise covariance (GPS noise)
+        r = 5.0  # meters variance, tune this as needed
+        self.R = np.eye(3) * r
+
+    def predict(self, a):
+        """Predict step with acceleration input a = [ax, ay, az]."""
+        a = np.reshape(a, (3, 1))
+        self.x = self.F @ self.x + self.B @ a
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+    def update(self, z):
+        """Update step with GPS position measurement z = [x, y, z]."""
+        z = np.reshape(z, (3, 1))
+        y = z - self.H @ self.x  # Innovation
+        S = self.H @ self.P @ self.H.T + self.R  # Innovation covariance
+        K = self.P @ self.H.T @ np.linalg.inv(S)  # Kalman gain
+
+        self.x = self.x + K @ y
+        self.P = (np.eye(6) - K @ self.H) @ self.P
+
+    def get_state(self):
+        return self.x.flatten()
+
+
+# Example usage with your data:
+import pandas as pd
+
+
+def load_sample(file_path):
+    """Load single sample data from a text file into a list of floats."""
+    with open(file_path, 'r') as f:
+        lines = f.read().strip().split('\n')
+    return list(map(float, lines))
+
+
+def process_folder(data_folder, timestamp_file, dt_default=0.1):
+    """Process all data files in folder and run Kalman filter fusion."""
+    # Load timestamps
+    with open(timestamp_file, 'r') as f:
+        timestamps = list(map(int, f.read().strip().split('\n')))
+
+    # List all txt files, sort to ensure order
+    files = sorted(glob(os.path.join(data_folder, '*.txt')))
+
+    # Make sure files and timestamps have same length
+    assert len(files) == len(timestamps), "Files and timestamps count mismatch"
+
+    # Load first sample for reference coordinate origin
+    first_sample = load_sample(files[0])
+    lat_ref, lon_ref, alt_ref = first_sample[0], first_sample[1], first_sample[2]
+
+    # Initialize Kalman filter
+    kf = KalmanFilter(dt=dt_default)
+
+    # Initialize storage for filtered results
+    filtered_states = []
+
+    prev_vel_enu = None
+    prev_time = timestamps[0]
+
+    for i, file in enumerate(files):
+        sample = load_sample(file)
+        time = timestamps[i]
+
+        # Extract GPS lat/lon/alt
+        lat, lon, alt = sample[0], sample[1], sample[2]
+        # Convert to ENU position
+        pos_enu = llh_to_enu(lat, lon, alt, lat_ref, lon_ref, alt_ref)
+
+        # Extract velocity in NED and convert to ENU
+        v_ned = np.array([sample[7], sample[8], sample[9]])
+        v_enu = np.array([v_ned[1], v_ned[0], -v_ned[2]])
+
+        # Calculate dt from timestamps in seconds
+        dt = (time - prev_time) * 1e-9  # nanoseconds to seconds
+        if dt <= 0:
+            dt = dt_default
+
+        # Update Kalman Filter dt & matrices dynamically
+        kf.dt = dt
+        kf.F[0, 3] = dt
+        kf.F[1, 4] = dt
+        kf.F[2, 5] = dt
+        kf.B[0, 0] = 0.5 * dt ** 2
+        kf.B[1, 1] = 0.5 * dt ** 2
+        kf.B[2, 2] = 0.5 * dt ** 2
+        kf.B[3, 0] = dt
+        kf.B[4, 1] = dt
+        kf.B[5, 2] = dt
+
+        if i == 0:
+            # Initialize state vector
+            kf.x[:3, 0] = pos_enu
+            kf.x[3:, 0] = v_enu
+            prev_vel_enu = v_enu
+        else:
+            # Approximate acceleration from velocity difference
+            a = (v_enu - prev_vel_enu) / dt
+            prev_vel_enu = v_enu
+
+            # Predict step with acceleration input
+            kf.predict(a)
+
+            # Update step with GPS position
+            kf.update(pos_enu)
+
+        prev_time = time
+
+        # Store filtered state
+        filtered_states.append(kf.get_state())
+
+    return np.array(filtered_states)
+
+# Example usage:
+data_folder = r"C:\Users\ramos\Desktop\sync_data\_2021-08-06-10-59-33\gps_imu\data"
+timestamp_file = r"C:\Users\ramos\Desktop\sync_data\_2021-08-06-10-59-33\gps_imu\data_timestamp.txt"
+filtered_results = process_folder(data_folder, timestamp_file)
+
+print(filtered_results)
+east = filtered_results[:, 0]
+north = filtered_results[:, 1]
+up = filtered_results[:, 2]
+
+# Plot 2D trajectory (East vs North)
+plt.figure(figsize=(10, 8))
+plt.plot(east, north, label='Kalman Filter Position')
+plt.xlabel('East (m)')
+plt.ylabel('North (m)')
+plt.title('Filtered 2D Trajectory (East-North Plane)')
 plt.legend()
+plt.axis('equal')  # Equal scale for x and y
 plt.grid(True)
-plt.axis('equal')
-plt.tight_layout()
 plt.show()
 
-# Plot 2: Velocity Magnitude Over Time
-velocity = np.sqrt(ekf_result['ekf_vx']**2 + ekf_result['ekf_vy']**2)
-
+# Plot altitude (Up) over time samples
 plt.figure(figsize=(10, 4))
-plt.plot(ekf_result['time_s'], velocity, label='EKF Speed (m/s)', color='tab:green')
-plt.xlabel('Time (s)')
-plt.ylabel('Speed (m/s)')
-plt.title('Estimated Speed Over Time')
+plt.plot(up, label='Altitude (Up)')
+plt.xlabel('Sample index')
+plt.ylabel('Altitude (m)')
+plt.title('Filtered Altitude over Time')
+plt.legend()
 plt.grid(True)
-plt.tight_layout()
+plt.show()
+# Load raw GPS positions for comparison
+raw_positions = []
+files = sorted(glob(os.path.join(data_folder, '*.txt')))
+first_sample = load_sample(files[0])
+lat_ref, lon_ref, alt_ref = first_sample[0], first_sample[1], first_sample[2]
+
+for f in files:
+    sample = load_sample(f)
+    lat, lon, alt = sample[0], sample[1], sample[2]
+    pos_enu = llh_to_enu(lat, lon, alt, lat_ref, lon_ref, alt_ref)
+    raw_positions.append(pos_enu)
+
+raw_positions = np.array(raw_positions)
+
+plt.figure(figsize=(10, 8))
+plt.plot(raw_positions[:, 0], raw_positions[:, 1], label='Raw GPS Position', alpha=0.6)
+plt.plot(east, north, label='Filtered Position')
+plt.xlabel('East (m)')
+plt.ylabel('North (m)')
+plt.title('Raw GPS vs Filtered Trajectory')
+plt.legend()
+plt.axis('equal')
+plt.grid(True)
 plt.show()
