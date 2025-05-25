@@ -2,6 +2,7 @@ import numpy as np
 from glob import glob
 import os
 import matplotlib.pyplot as plt
+import pandas as pd
 # WGS84 constants for conversion
 a = 6378137.0  # semi-major axis
 f = 1 / 298.257223563  # flattening
@@ -50,63 +51,69 @@ def llh_to_enu(lat, lon, alt, lat_ref, lon_ref, alt_ref):
 # Kalman Filter Class
 class KalmanFilter:
     def __init__(self, dt):
-        # State vector: [x, y, z, vx, vy, vz]
         self.dt = dt
-        self.x = np.zeros((6, 1))
-        self.P = np.eye(6) * 1.0  # Initial covariance
+        self.x = np.zeros((6, 1))  # [x, y, z, vx, vy, vz]
+        self.P = np.eye(6) * 1.0   # Initial uncertainty
 
-        # State transition matrix
-        self.F = np.eye(6)
-        self.F[0, 3] = dt
-        self.F[1, 4] = dt
-        self.F[2, 5] = dt
-
-        # Control matrix (acceleration input)
-        self.B = np.zeros((6, 3))
-        self.B[0, 0] = 0.5 * dt ** 2
-        self.B[1, 1] = 0.5 * dt ** 2
-        self.B[2, 2] = 0.5 * dt ** 2
-        self.B[3, 0] = dt
-        self.B[4, 1] = dt
-        self.B[5, 2] = dt
-
-        # Measurement matrix: we measure positions only (GPS)
-        self.H = np.zeros((3, 6))
-        self.H[0, 0] = 1
-        self.H[1, 1] = 1
-        self.H[2, 2] = 1
-
-        # Process noise covariance
+        # Process noise
         q = 1e-3
         self.Q = np.eye(6) * q
 
-        # Measurement noise covariance (GPS noise)
-        r = 5.0  # meters variance, tune this as needed
+        # Measurement noise (for GPS position)
+        r = 5.0
         self.R = np.eye(3) * r
 
+    def f(self, x, a):
+        """Nonlinear state transition function with acceleration input a = [ax, ay, az]."""
+        dt = self.dt
+        pos = x[:3]
+        vel = x[3:]
+
+        new_pos = pos + vel * dt + 0.5 * a.reshape((3, 1)) * dt**2
+        new_vel = vel + a.reshape((3, 1)) * dt
+
+        return np.vstack((new_pos, new_vel))
+
+    def F_jacobian(self):
+        """Jacobian of the motion model w.r.t. the state."""
+        dt = self.dt
+        F = np.eye(6)
+        F[0, 3] = dt
+        F[1, 4] = dt
+        F[2, 5] = dt
+        return F
+
+    def h(self, x):
+        """Measurement function — maps state to position observation."""
+        return x[:3]
+
+    def H_jacobian(self):
+        """Jacobian of the measurement function w.r.t. the state."""
+        H = np.zeros((3, 6))
+        H[0, 0] = 1
+        H[1, 1] = 1
+        H[2, 2] = 1
+        return H
+
     def predict(self, a):
-        """Predict step with acceleration input a = [ax, ay, az]."""
-        a = np.reshape(a, (3, 1))
-        self.x = self.F @ self.x + self.B @ a
-        self.P = self.F @ self.P @ self.F.T + self.Q
+        """EKF prediction step."""
+        self.x = self.f(self.x, a)
+        F = self.F_jacobian()
+        self.P = F @ self.P @ F.T + self.Q
 
     def update(self, z):
-        """Update step with GPS position measurement z = [x, y, z]."""
+        """EKF update step with position measurement z = [x, y, z]."""
         z = np.reshape(z, (3, 1))
-        y = z - self.H @ self.x  # Innovation
-        S = self.H @ self.P @ self.H.T + self.R  # Innovation covariance
-        K = self.P @ self.H.T @ np.linalg.inv(S)  # Kalman gain
+        y = z - self.h(self.x)  # Innovation
+        H = self.H_jacobian()
+        S = H @ self.P @ H.T + self.R  # Innovation covariance
+        K = self.P @ H.T @ np.linalg.inv(S)  # Kalman gain
 
         self.x = self.x + K @ y
-        self.P = (np.eye(6) - K @ self.H) @ self.P
+        self.P = (np.eye(6) - K @ H) @ self.P
 
     def get_state(self):
         return self.x.flatten()
-
-
-# Example usage with your data:
-import pandas as pd
-
 
 def load_sample(file_path):
     """Load single sample data from a text file into a list of floats."""
@@ -160,15 +167,6 @@ def process_folder(data_folder, timestamp_file, dt_default=0.1):
 
         # Update Kalman Filter dt & matrices dynamically
         kf.dt = dt
-        kf.F[0, 3] = dt
-        kf.F[1, 4] = dt
-        kf.F[2, 5] = dt
-        kf.B[0, 0] = 0.5 * dt ** 2
-        kf.B[1, 1] = 0.5 * dt ** 2
-        kf.B[2, 2] = 0.5 * dt ** 2
-        kf.B[3, 0] = dt
-        kf.B[4, 1] = dt
-        kf.B[5, 2] = dt
 
         if i == 0:
             # Initialize state vector
@@ -194,8 +192,8 @@ def process_folder(data_folder, timestamp_file, dt_default=0.1):
     return np.array(filtered_states)
 
 # Example usage:
-data_folder = r"C:\Users\ramos\Desktop\sync_data\_2021-08-06-10-59-33\gps_imu\data"
-timestamp_file = r"C:\Users\ramos\Desktop\sync_data\_2021-08-06-10-59-33\gps_imu\data_timestamp.txt"
+data_folder = r'dataset\gps_imu\data'
+timestamp_file = r"dataset\gps_imu\data_timestamp.txt"
 filtered_results = process_folder(data_folder, timestamp_file)
 
 print(filtered_results)
